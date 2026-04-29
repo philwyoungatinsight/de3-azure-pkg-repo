@@ -1,0 +1,65 @@
+#!/bin/bash
+# azure-pkg setup — installs the Azure CLI.
+# Idempotent: checks whether each tool is present before installing.
+# Supports macOS (Homebrew), Debian/Ubuntu (apt), and Fedora/RHEL (dnf).
+
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+_is_debian() {
+    [ -f /etc/debian_version ]
+}
+
+_has_brew() {
+    command -v brew >/dev/null 2>&1
+}
+
+_has_dnf() {
+    command -v dnf >/dev/null 2>&1
+}
+
+# ── Azure CLI ─────────────────────────────────────────────────────────────────
+# https://learn.microsoft.com/en-us/cli/azure/install-azure-cli
+_setup_azure_cli() {
+    if command -v az >/dev/null 2>&1; then
+        echo "  az: $(az --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing Azure CLI..."
+    if _has_brew; then
+        brew install azure-cli
+    elif _is_debian; then
+        # Official Debian/Ubuntu install script
+        curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash
+    elif _has_dnf; then
+        # Official RPM repo for Fedora/RHEL
+        sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+        sudo dnf install -y 'dnf-command(config-manager)' 2>/dev/null || \
+            sudo dnf install -y dnf-plugins-core
+        sudo dnf config-manager --add-repo \
+            https://packages.microsoft.com/yumrepos/azure-cli
+        sudo dnf install -y azure-cli
+    else
+        echo "ERROR: unsupported platform for automatic Azure CLI install." >&2
+        echo "       Install manually: https://learn.microsoft.com/en-us/cli/azure/install-azure-cli" >&2
+        exit 1
+    fi
+    echo "  az installed: $(az --version 2>&1 | head -1)"
+}
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+_install_tools() {
+    echo "=== azure-pkg setup ==="
+    _setup_azure_cli
+    echo "=== azure-pkg setup complete ==="
+}
+
+case "${1:-}" in
+    "") _install_tools ;;
+    *)  exec "$(dirname "$0")/seed" "$@" ;;
+esac

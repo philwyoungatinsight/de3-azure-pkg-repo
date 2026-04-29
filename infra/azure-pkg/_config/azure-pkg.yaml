@@ -1,0 +1,10 @@
+azure-pkg:
+  _provides_capability:
+  - azure-pkg: "1.0.0"
+  seed:
+    subscription_id: ""
+    resource_group: ""
+    storage_account: ""
+    container_name: "tfstate"
+    region: "eastus"
+    sp_name: ""

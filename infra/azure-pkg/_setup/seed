@@ -1,0 +1,411 @@
+#!/bin/bash
+# azure-pkg seed — provisions the Azure seed resources (SP, Resource Group,
+# Storage Account, Blob Container) needed to store Terraform remote state.
+# Invoked directly or via: infra/azure-pkg/_setup/run <subcommand>
+
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line ${LINENO:-not-defined}: ${BASH_COMMAND:-not-defined}"
+    exit $exit_status
+}
+trap handle_error ERR
+
+. "$(git rev-parse --show-toplevel)/set_env.sh"
+. "$_UTILITIES_DIR/bash/framework-utils.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+################################################################################
+# AZURE CORE LOGIC
+################################################################################
+
+# Find the Azure package SOPS secrets file.
+_sops_secrets_file() {
+    echo "${_INFRA_DIR}/azure-pkg/_config/azure-pkg_secrets.sops.yaml"
+}
+
+# Write the SP credentials from KEY_FILE into the lab-stack SOPS secrets file.
+# Called after every SP create or credential reset.
+_write_credentials_to_sops() {
+    local client_id client_secret
+    client_id=$(jq -r .clientId "$KEY_FILE")
+    client_secret=$(jq -r .clientSecret "$KEY_FILE")
+    "$_CONFIG_MGR" set-raw azure-pkg azure-pkg_secrets.providers.azure.client_id "$client_id" --sops
+    "$_CONFIG_MGR" set-raw azure-pkg azure-pkg_secrets.providers.azure.client_secret "$client_secret" --sops
+    echo "  ✅ SOPS secrets synced (client_id: $client_id)."
+}
+
+# Blank out Azure credentials in SOPS (called from clean-all so downstream
+# consumers fail clearly rather than with a misleading AADSTS700016 error).
+_clear_sops_credentials() {
+    "$_CONFIG_MGR" set-raw azure-pkg azure-pkg_secrets.providers.azure.client_id '""' --sops 2>/dev/null || true
+    "$_CONFIG_MGR" set-raw azure-pkg azure-pkg_secrets.providers.azure.client_secret '""' --sops 2>/dev/null || true
+    echo "✅ SOPS Azure credentials cleared."
+}
+
+# Validate the credentials in KEY_FILE by requesting an OAuth2 token.
+# Returns 0 if valid, 1 if invalid (expired, revoked, or wrong secret).
+# Uses a direct REST call so the current 'az' session is not affected.
+_sp_credentials_valid() {
+    local client_id client_secret tenant_id response
+    client_id=$(jq -r .clientId "$KEY_FILE")
+    client_secret=$(jq -r .clientSecret "$KEY_FILE")
+    tenant_id=$(jq -r .tenantId "$KEY_FILE")
+    response=$(curl -s -X POST \
+        "https://login.microsoftonline.com/$tenant_id/oauth2/v2.0/token" \
+        --data-urlencode "grant_type=client_credentials" \
+        --data-urlencode "client_id=$client_id" \
+        --data-urlencode "client_secret=$client_secret" \
+        --data-urlencode "scope=https://management.azure.com/.default" 2>/dev/null)
+    # A successful response has an access_token; an error response has an error field.
+    ! echo "$response" | jq -e '.error' &>/dev/null
+}
+
+# Read the client_id currently stored in SOPS (empty string if not found).
+_get_sops_client_id() {
+    local sops_file
+    sops_file=$(_sops_secrets_file)
+    [ -z "$sops_file" ] && { echo ""; return 0; }
+    SOPS_AGE_KEY_FILE="$HOME/.sops/age/keys.txt" sops -d "$sops_file" 2>/dev/null \
+        | python3 -c "
+import yaml, sys
+cfg = yaml.safe_load(sys.stdin)
+print(cfg.get('azure-pkg_secrets', {}).get('providers', {}).get('azure', {}).get('client_id', ''))
+" 2>/dev/null || echo ""
+}
+
+# Create a new SP (empty first arg) or reset credentials of an existing one.
+# Writes KEY_FILE and syncs SOPS in both cases.
+_create_or_reset_sp() {
+    local existing_app_id="${1:-}"
+    local sp_output
+    if [ -z "$existing_app_id" ]; then
+        echo "  Creating Service Principal: $SP_NAME..."
+        sp_output=$(az ad sp create-for-rbac \
+            --name "$SP_NAME" \
+            --role Contributor \
+            --scopes "/subscriptions/$REQUIRED_SUBSCRIPTION_ID" \
+            --output json)
+    else
+        echo "  Resetting credentials for Service Principal: $SP_NAME ($existing_app_id)..."
+        sp_output=$(az ad sp credential reset --id "$existing_app_id" --output json)
+    fi
+    # Both create-for-rbac and credential reset return: appId, password, tenant
+    jq -n \
+        --arg clientId       "$(echo "$sp_output" | jq -r .appId)" \
+        --arg clientSecret   "$(echo "$sp_output" | jq -r .password)" \
+        --arg subscriptionId "$REQUIRED_SUBSCRIPTION_ID" \
+        --arg tenantId       "$(echo "$sp_output" | jq -r .tenant)" \
+        '{clientId:$clientId, clientSecret:$clientSecret,
+          subscriptionId:$subscriptionId, tenantId:$tenantId}' \
+        > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    _write_credentials_to_sops
+}
+
+check_subscription() {
+    echo "Verifying Azure Subscription..."
+    if ! command -v az &> /dev/null; then
+        echo "❌ Azure CLI not installed. Run: $(dirname "$0")/run" >&2
+        exit 1
+    fi
+
+    CURRENT_SUBSCRIPTION_ID=$(az account show --query "id" --output tsv 2>/dev/null || echo "")
+    if [ -z "$CURRENT_SUBSCRIPTION_ID" ]; then
+        echo "❌ Not logged into Azure. Please run 'az login' first."
+        exit 1
+    fi
+
+    if [ "$CURRENT_SUBSCRIPTION_ID" != "$REQUIRED_SUBSCRIPTION_ID" ]; then
+        echo "❌ SUBSCRIPTION MISMATCH: Session is $CURRENT_SUBSCRIPTION_ID, but Config requires $REQUIRED_SUBSCRIPTION_ID"
+        echo "   Run: az account set --subscription $REQUIRED_SUBSCRIPTION_ID"
+        exit 1
+    fi
+    echo "✅ Subscription Verified: $CURRENT_SUBSCRIPTION_ID"
+}
+
+setup_azure() {
+    check_subscription
+    echo "Syncing Azure Seed Resources..."
+
+    # 1. Register Microsoft.Storage provider (required for new subscriptions;
+    #    Azure returns misleading "SubscriptionNotFound" if this is missing)
+    STORAGE_RP_STATE=$(az provider show --namespace Microsoft.Storage --query "registrationState" -o tsv 2>/dev/null || echo "NotRegistered")
+    if [ "$STORAGE_RP_STATE" != "Registered" ]; then
+        echo "Registering Microsoft.Storage provider..."
+        az provider register --namespace Microsoft.Storage
+        echo "Waiting for registration..."
+        for i in {1..24}; do
+            STORAGE_RP_STATE=$(az provider show --namespace Microsoft.Storage --query "registrationState" -o tsv)
+            if [ "$STORAGE_RP_STATE" == "Registered" ]; then
+                echo "✅ Microsoft.Storage provider registered."
+                break
+            fi
+            echo "  State: $STORAGE_RP_STATE ($i/24)..."
+            sleep 5
+        done
+        if [ "$STORAGE_RP_STATE" != "Registered" ]; then
+            echo "❌ Microsoft.Storage registration timed out (state: $STORAGE_RP_STATE)"
+            exit 1
+        fi
+    else
+        echo "✅ Microsoft.Storage provider already registered."
+    fi
+
+    # 2. Resource Group
+    if ! az group show --name "$RESOURCE_GROUP" &>/dev/null; then
+        echo "Creating Resource Group: $RESOURCE_GROUP (region: $REGION)..."
+        az group create --name "$RESOURCE_GROUP" --location "$REGION"
+    else
+        echo "✅ Resource Group $RESOURCE_GROUP already exists."
+    fi
+
+    # 3. Storage Account
+    if ! az storage account show --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
+        echo "Creating Storage Account: $STORAGE_ACCOUNT..."
+        az storage account create \
+            --name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --location "$REGION" \
+            --sku Standard_LRS \
+            --encryption-services blob \
+            --subscription "$REQUIRED_SUBSCRIPTION_ID"
+
+        echo "Enabling blob versioning..."
+        az storage account blob-service-properties update \
+            --account-name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --enable-versioning true
+    else
+        echo "✅ Storage Account $STORAGE_ACCOUNT already exists."
+    fi
+
+    # 4. Blob Container (use storage account key to avoid needing Storage Blob Data roles)
+    STORAGE_KEY=$(az storage account keys list \
+        --account-name "$STORAGE_ACCOUNT" \
+        --resource-group "$RESOURCE_GROUP" \
+        --query "[0].value" -o tsv)
+    if ! az storage container show \
+            --name "$CONTAINER_NAME" \
+            --account-name "$STORAGE_ACCOUNT" \
+            --account-key "$STORAGE_KEY" &>/dev/null; then
+        echo "Creating Blob Container: $CONTAINER_NAME..."
+        az storage container create \
+            --name "$CONTAINER_NAME" \
+            --account-name "$STORAGE_ACCOUNT" \
+            --account-key "$STORAGE_KEY"
+    else
+        echo "✅ Blob Container $CONTAINER_NAME already exists."
+    fi
+
+    # 5. Service Principal — ensure exactly one exists, KEY_FILE is current, SOPS is in sync.
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+
+    # Guard against accidental duplicate SPs with the same display name.
+    SP_COUNT=$(az ad sp list --display-name "$SP_NAME" --query "length(@)" -o tsv 2>/dev/null || echo "0")
+    if [ "$SP_COUNT" -gt 1 ]; then
+        echo "❌ Found $SP_COUNT service principals named '$SP_NAME' — expected at most 1."
+        echo "   List them: az ad sp list --display-name '$SP_NAME'"
+        echo "   Delete extras, keeping only the one whose appId matches $KEY_FILE (if it exists)."
+        exit 1
+    fi
+
+    SP_APP_ID=$(az ad sp list --display-name "$SP_NAME" --query "[0].appId" -o tsv 2>/dev/null || true)
+    KEY_APP_ID=$(jq -r '.clientId // empty' "$KEY_FILE" 2>/dev/null || true)
+
+    if [ -z "$SP_APP_ID" ]; then
+        # SP does not exist — create it.
+        _create_or_reset_sp ""
+        SP_APP_ID=$(jq -r .clientId "$KEY_FILE")
+        echo "✅ Service Principal created: $SP_NAME ($SP_APP_ID)."
+    elif [ -z "$KEY_APP_ID" ] || [ "$KEY_APP_ID" != "$SP_APP_ID" ]; then
+        # KEY_FILE is absent or references a different (stale) SP — reset credentials.
+        echo "  SP exists ($SP_APP_ID) but KEY_FILE is missing or has stale ID ($KEY_APP_ID)."
+        _create_or_reset_sp "$SP_APP_ID"
+        echo "✅ Service Principal credentials refreshed: $SP_NAME ($SP_APP_ID)."
+    else
+        echo "✅ Service Principal $SP_NAME ($SP_APP_ID) — KEY_FILE appId is current."
+        # Validate that the secret in KEY_FILE actually works against Azure.
+        if ! _sp_credentials_valid; then
+            echo "  KEY_FILE secret is invalid (rotated or revoked) — resetting SP credentials..."
+            _create_or_reset_sp "$SP_APP_ID"
+            echo "✅ Service Principal credentials refreshed: $SP_NAME ($SP_APP_ID)."
+        else
+            echo "✅ Service Principal credentials validated."
+            # Ensure SOPS is also in sync even if credentials did not change.
+            SOPS_CLIENT_ID=$(_get_sops_client_id || echo "")
+            if [ "$SOPS_CLIENT_ID" != "$SP_APP_ID" ]; then
+                echo "  SOPS client_id ($SOPS_CLIENT_ID) is out of sync — updating..."
+                _write_credentials_to_sops
+            else
+                echo "✅ SOPS credentials are already in sync."
+            fi
+        fi
+    fi
+
+    echo ""
+    echo "✅ Credentials saved. To authenticate Terraform/OpenTofu:"
+    echo "   export ARM_CLIENT_ID=\$(jq -r .clientId $KEY_FILE)"
+    echo "   export ARM_CLIENT_SECRET=\$(jq -r .clientSecret $KEY_FILE)"
+    echo "   export ARM_SUBSCRIPTION_ID=\$(jq -r .subscriptionId $KEY_FILE)"
+    echo "   export ARM_TENANT_ID=\$(jq -r .tenantId $KEY_FILE)"
+    echo "   # Or: export AZURE_AUTH_LOCATION=$KEY_FILE"
+}
+
+################################################################################
+# CLI COMMANDS
+################################################################################
+
+SEP='################################################################################'
+
+function build() {
+    echo "$SEP"
+    echo "BUILDING AZURE SEED"
+    echo "$SEP"
+    setup_azure
+}
+
+function test_app() {
+    check_subscription
+    echo "Running connectivity test to Azure Blob Storage..."
+    STORAGE_KEY=$(az storage account keys list \
+        --account-name "$STORAGE_ACCOUNT" \
+        --resource-group "$RESOURCE_GROUP" \
+        --query "[0].value" -o tsv)
+    echo "test-data-$(date)" > connection-test.tmp
+    az storage blob upload \
+        --account-name "$STORAGE_ACCOUNT" \
+        --container-name "$CONTAINER_NAME" \
+        --account-key "$STORAGE_KEY" \
+        --name "test-connection.txt" \
+        --file connection-test.tmp \
+        --overwrite
+    az storage blob delete \
+        --account-name "$STORAGE_ACCOUNT" \
+        --container-name "$CONTAINER_NAME" \
+        --account-key "$STORAGE_KEY" \
+        --name "test-connection.txt"
+    rm connection-test.tmp
+    echo "✅ Azure Blob Storage Read/Write Verified."
+}
+
+function clean() {
+    echo "Wiping local credentials file..."
+    rm -rf "$KEY_DIR"
+    echo "✅ Local credentials removed."
+}
+
+function clean_all() {
+    check_subscription
+
+    echo "$SEP"
+    echo "DANGER: Destructive Deletion of Azure Seed Resources"
+    echo "Target Subscription: $REQUIRED_SUBSCRIPTION_ID"
+    echo "  Resource Group:  $RESOURCE_GROUP (contains Storage Account and Container)"
+    echo "  Service Principal: $SP_NAME"
+    echo "$SEP"
+
+    read -p "Type the Subscription ID ($REQUIRED_SUBSCRIPTION_ID) to confirm deletion: " CONFIRM_ID
+    if [[ "$CONFIRM_ID" == "$REQUIRED_SUBSCRIPTION_ID" ]]; then
+
+        # Idempotent Resource Group deletion (also removes Storage Account and Container)
+        if az group show --name "$RESOURCE_GROUP" &>/dev/null; then
+            echo "Deleting Resource Group (and all contents): $RESOURCE_GROUP..."
+            az group delete --name "$RESOURCE_GROUP" --yes --no-wait
+            echo "✅ Resource Group deletion initiated (runs in background)."
+        else
+            echo "✅ Resource Group $RESOURCE_GROUP does not exist. Skipping."
+        fi
+
+        # Idempotent Service Principal cleanup
+        SP_ID=$(az ad sp list --display-name "$SP_NAME" --query "[0].id" -o tsv 2>/dev/null || echo "")
+        if [ -n "$SP_ID" ]; then
+            echo "Deleting Service Principal: $SP_NAME ($SP_ID)..."
+            az ad sp delete --id "$SP_ID"
+        else
+            echo "✅ Service Principal $SP_NAME does not exist. Skipping."
+        fi
+
+        _clear_sops_credentials
+        clean
+
+        echo "✅ Azure Resources and local credentials wiped."
+    else
+        echo "Confirmation failed. Aborting."
+        exit 1
+    fi
+}
+
+function show_status() {
+    echo "$SEP"
+    echo "AZURE STATUS"
+    echo "$SEP"
+    echo "Subscription:    $REQUIRED_SUBSCRIPTION_ID"
+    echo "Tenant:          $TENANT_ID"
+    echo "Resource Group:  $RESOURCE_GROUP"
+    echo "Storage Account: $STORAGE_ACCOUNT/$CONTAINER_NAME"
+    echo "Portal:          https://portal.azure.com/#resource/subscriptions/$REQUIRED_SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/overview"
+    echo ""
+    if command -v az &>/dev/null; then
+        az storage account show \
+            --name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "{name:name, location:primaryLocation, sku:sku.name, versioning:blobServiceProperties}" \
+            --output table 2>/dev/null || echo "Storage account not found."
+    fi
+}
+
+function show_usage() {
+    printf "Usage: %s <command>\n" "$0"
+    cat <<EOF
+    --seed|-b       Provision Azure seed resources (SP, RG, Storage Account, Container)
+    --login|-l      Verify the active Azure subscription matches config
+    --test|-t       Verify Blob Storage read/write access
+    --status|-S     Show Azure resource status
+    --clean         Remove local credentials file
+    --clean-all     DELETE credentials, Storage Account, Resource Group, and Service Principal
+    --help|-h       Show this help
+EOF
+    exit 0
+}
+
+################################################################################
+# Config loading — deferred so it only runs for seed sub-commands
+################################################################################
+
+_load_seed_config() {
+    COMP_NAME='azure-pkg'
+
+    COMPONENT_CONF=$(_find_component_config "$COMP_NAME") || exit 1
+
+    REQUIRED_SUBSCRIPTION_ID=$(yq -r '."azure-pkg".seed.subscription_id' "$COMPONENT_CONF")
+    RESOURCE_GROUP=$(yq -r '."azure-pkg".seed.resource_group' "$COMPONENT_CONF")
+    STORAGE_ACCOUNT=$(yq -r '."azure-pkg".seed.storage_account' "$COMPONENT_CONF")
+    CONTAINER_NAME=$(yq -r '."azure-pkg".seed.container_name // "tfstate"' "$COMPONENT_CONF")
+    REGION=$(yq -r '."azure-pkg".seed.region // "eastus"' "$COMPONENT_CONF")
+    local _tmp
+    _tmp=$(yq -r '."azure-pkg".seed.sp_name // ""' "$COMPONENT_CONF")
+    SP_NAME="${_tmp:-$STORAGE_ACCOUNT}"
+
+    # tenant_id is auto-detected from the active az login session
+    TENANT_ID=$(az account show --query tenantId -o tsv 2>/dev/null || echo "")
+
+    export KEY_DIR="$_CONFIG_TMP_DIR/seed/azure/azure-credentials"
+    export KEY_FILE="$KEY_DIR/tf-sp-credentials.json"
+}
+
+################################################################################
+# MAIN DISPATCHER
+################################################################################
+
+case "${1:-}" in
+    --seed|-b)    _load_seed_config; build ;;
+    --login|-l)   _load_seed_config; check_subscription ;;
+    --test|-t)    _load_seed_config; test_app ;;
+    --status|-S)  _load_seed_config; show_status ;;
+    --clean)      _load_seed_config; clean ;;
+    --clean-all)  _load_seed_config; clean_all ;;
+    --help|-h)    show_usage ;;
+    *) echo "Usage: $0 <--seed|--login|--test|--status|--clean|--clean-all>" >&2; exit 1 ;;
+esac
