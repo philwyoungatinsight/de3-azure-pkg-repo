@@ -8,3 +8,33 @@ azure-pkg:
     container_name: "tfstate"
     region: "eastus"
     sp_name: ""
+
+  config_params:
+    # ---------------------------------------------------------------------------
+    # Example deployment — illustrates the required config structure.
+    # Copy to your deployment package (e.g. pwy-home-lab-pkg) and set real values.
+    # ---------------------------------------------------------------------------
+    azure-pkg/_stack/azure/examples-archive:
+      _env: example
+      _provider: azure
+      _skip_on_build: true
+      _region: eastus
+      project_prefix: example
+
+    azure-pkg/_stack/azure/examples-archive/example-lab/eastus/dev:
+      _env: dev
+      _region: eastus
+      _wave: cloud.storage
+      project_prefix: example
+
+    azure-pkg/_stack/azure/examples-archive/example-lab/eastus/dev/buckets:
+      resource_group_name: example-test-bucket-rg
+      storage_account_name: exampletestbkt   # 3-24 lowercase alphanumeric, globally unique
+
+    azure-pkg/_stack/azure/examples-archive/example-lab/eastus/dev/buckets/test-bucket:
+      _unit_purpose: >
+        Example Azure Blob Storage container. Copy to your deployment package
+        and set real subscription_id (from seed config), resource_group_name,
+        storage_account_name (globally unique), and container_name.
+      _wave: cloud.storage
+      force_destroy: true
